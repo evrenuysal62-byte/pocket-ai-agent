@@ -1,3 +1,6 @@
+
+    
+  
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -92,12 +95,12 @@ def analyze(frame, threshold, min_votes):
     model.fit(labeled.loc[:split-1,FEATURES],labeled.loc[:split-1,"future_up"].astype(int))
     test=labeled.loc[split:]; accuracy=accuracy_score(test.future_up.astype(int),model.predict(test[FEATURES]))
     latest=usable.iloc[[-1]]; classes=list(model.classes_); probs=model.predict_proba(latest[FEATURES])[0]
-    p_up=float(probs[classes.index(1)]) if 1 in classes else .5; confidence=max(p_up,1-p_up); model_dir="CALL" if p_up>=.5 else "PUT"
+    p_up=float(probs[classes.index(1)]) if 1 in classes else .5; confidence=max(p_up,1-p_up); model_dir="Yükseliş" if p_up>=.5 else "Düşüş"
     r=latest.iloc[0]
     votes=[1 if r.ema12>r.ema26 else -1,1 if r.ema26>r.ema50 else -1,1 if r.macd>r.macd_signal else -1]
     votes.append(1 if r.rsi>=55 else -1 if r.rsi<=45 else 0)
-    up=sum(v==1 for v in votes); down=sum(v==-1 for v in votes); tech_dir="CALL" if up>down else "PUT" if down>up else "BEKLE"
-    support=up if model_dir=="CALL" else down
+    up=sum(v==1 for v in votes); down=sum(v==-1 for v in votes); tech_dir="Yükseliş" if up>down else "Düşüş" if down>up else "BEKLE"
+    support=up if model_dir=="Yükseliş" else down
     if confidence<threshold: signal,reason="BEKLE","Model yön skoru eşik altında."
     elif tech_dir=="BEKLE": signal,reason="BEKLE","Teknik göstergeler net bir yönde uzlaşmıyor."
     elif model_dir!=tech_dir: signal,reason="BEKLE","Model yönü ile teknik göstergeler çelişiyor."
@@ -126,51 +129,4 @@ else: st.success(f"Veri alındı · M1: {m1_data.timestamp.iloc[-1]:%d.%m %H:%M}
 results={}; cols=st.columns(2)
 for col,tf,frame in [(cols[0],"M1",m1_data),(cols[1],"M5",m5_data)]:
     with col:
-        st.subheader(f"{tf} ANALİZİ")
-        try: result=analyze(frame,threshold,min_votes); results[tf]=result
-        except Exception as exc: st.error(f"{tf} analizi yapılamadı: {exc}"); continue
-        st.metric("Karar",result["signal"]); st.metric("Model yön skoru",f'{result["confidence"]*100:.1f}%'); st.metric("Kronolojik test doğruluğu",f'{result["accuracy"]*100:.1f}%')
-        st.write(f'**Son fiyat:** {result["close"]:.5f}')
-        st.write(f'**Model:** {result["model_direction"]} · **Teknik:** {result["technical_direction"]}')
-        st.write(f'**RSI:** {result["rsi"]:.1f} · **EMA12:** {result["ema12"]:.5f} · **EMA26:** {result["ema26"]:.5f}')
-        st.caption(result["reason"])
-        # Candlestick chart: use actual OHLC fields rather than plotting only closes.
-        chart_data = result["data"].tail(100).copy()
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=chart_data["timestamp"],
-            open=chart_data["open"], high=chart_data["high"],
-            low=chart_data["low"], close=chart_data["close"],
-            name="Fiyat",
-            increasing_line_color="#d6ad4f",
-            decreasing_line_color="#e05b63",
-        ))
-        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema12"],
-                                 mode="lines", name="EMA12", line=dict(color="#f3d27a", width=1.5)))
-        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema26"],
-                                 mode="lines", name="EMA26", line=dict(color="#68a7ff", width=1.3)))
-        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema50"],
-                                 mode="lines", name="EMA50", line=dict(color="#b08cff", width=1.2)))
-        fig.update_layout(
-            template="plotly_dark", height=420, margin=dict(l=8, r=8, t=28, b=8),
-            paper_bgcolor="#11151c", plot_bgcolor="#11151c",
-            xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.04, x=0),
-            xaxis_title="İstanbul saati", yaxis_title="Fiyat",
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "responsive": True})
-        with st.expander(f"{tf} son 10 mum"):
-            recent=result["data"][["timestamp","open","high","low","close"]].tail(10).copy()
-            recent["değişim (%)"]=recent["close"].pct_change()*100
-            st.dataframe(recent,hide_index=True,use_container_width=True)
-st.subheader("M1 / M5 UYUM KONTROLÜ")
-if len(results)==2:
-    m1,m5=results["M1"],results["M5"]
-    if m1["signal"]==m5["signal"] and m1["signal"] in ("CALL","PUT"): st.success(f'M1 ve M5 aynı yönde: {m1["signal"]}. Bu bir doğruluk garantisi değildir.')
-    elif "BEKLE" in (m1["signal"],m5["signal"]): st.info("En az bir zaman dilimi BEKLE diyor. Çelişkiyi zorla AL/SAT'a çevirmiyoruz.")
-    else: st.warning("M1 ve M5 yönleri farklı; ekstra temkin gerekir.")
-    st.dataframe(pd.DataFrame([{"Zaman":tf,"Karar":r["signal"],"Model yönü":r["model_direction"],"Model yön skoru (%)":round(r["confidence"]*100,1),"Test doğruluğu (%)":round(r["accuracy"]*100,1),"RSI":round(r["rsi"],1),"Son mum (İstanbul)":str(r["timestamp"])} for tf,r in results.items()]),hide_index=True,use_container_width=True)
-with st.expander("Veri ve model notları"):
-    st.write(f"Sembol: {symbol} · M1 kayıt: {len(m1_data)} · M5 kayıt: {len(m5_data)}")
-    st.write(f"Son M1 yaşı: {age1:.1f} dakika · Son M5 yaşı: {age5:.1f} dakika")
-    st.caption("Model yön skoru kazanma olasılığı değildir. Test geçmiş verinin kronolojik bölümünde yapılır; geleceği garanti etmez. Uygulama otomatik işlem açmaz.")
-st.caption("Pocket AI Agent · Demo analiz aracı · Normal forex verisi OTC fiyatıyla farklı olabilir.")
+

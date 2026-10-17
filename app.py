@@ -2,154 +2,136 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 
-st.set_page_config(page_title="Pocket AI Agent — Live M1/M5", page_icon="📊", layout="wide")
-st.title("📊 Pocket AI Agent")
-st.caption("Twelve Data fiyat verisiyle M1/M5 demo analiz · Pocket Option'a bağlanmaz · İşlem açmaz")
-st.warning("Bu uygulama Twelve Data üzerinden normal piyasa fiyatlarını okur. Pocket Option/OTC fiyatlarıyla birebir aynı olmayabilir. İşlem açmaz.")
+st.set_page_config(page_title="Pocket AI Agent", page_icon="📈", layout="wide")
+st.markdown('''<style>
+.stApp{background:linear-gradient(145deg,#090b0f,#11151c 60%,#0b0d11);color:#f1f3f5}
+[data-testid="stSidebar"]{background:#11151b;border-right:1px solid #39332a}
+h1,h2,h3{color:#e8c56a!important}
+[data-testid="stMetric"]{background:#151a21;border:1px solid #39332a;padding:14px;border-radius:12px}
+.stButton>button{background:#d6ad4f;color:#111318;border:0;border-radius:9px;font-weight:700}
+</style>''', unsafe_allow_html=True)
+st.title("POCKET AI AGENT")
+st.caption("Twelve Data · M1 / M5 sinyal analizi · Premium Market Lab")
+st.warning("Bu uygulama analiz prototipidir; Pocket Option'a bağlanmaz ve işlem açmaz. Normal forex fiyatları Pocket Option/OTC fiyatlarından farklı olabilir. Sinyaller kâr garantisi değildir; önce demo ortamında test edin.")
 
-SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY"]
-
+SYMBOLS = ["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD","USD/CHF","NZD/USD","EUR/GBP","EUR/JPY","GBP/JPY"]
+TZ = ZoneInfo("Europe/Istanbul")
 with st.sidebar:
-    st.header("Piyasa ve sinyal ayarları")
+    st.header("Piyasa ayarları")
     symbol = st.selectbox("Forex paritesi", SYMBOLS)
-    outputsize = st.select_slider("İndirilecek mum sayısı", options=[100, 150, 200, 300], value=200)
-    threshold = st.slider("Model güven eşiği (%)", 50, 95, 65) / 100
-    st.caption("Yenileme iki API isteği yapabilir. Ücretsiz API limitlerini gözetin.")
-
+    outputsize = st.select_slider("Geçmiş mum sayısı", options=[150,200,300,500], value=300)
+    threshold = st.slider("Minimum model yön skoru (%)",50,80,58)/100
+    min_votes = st.select_slider("Gerekli teknik uyum", options=[1,2,3], value=2)
+    refresh = st.button("↻ Veriyi yenile", use_container_width=True)
+    st.caption("Her yenileme M1 ve M5 için API isteği yapar.")
 try:
     API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
 except Exception:
     API_KEY = ""
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_time_series(symbol, interval, outputsize, api_key):
-    response = requests.get(
-        "https://api.twelvedata.com/time_series",
-        params={"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": api_key, "format": "JSON"},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("status") == "error" or "values" not in payload:
-        raise RuntimeError(f"Twelve Data yanıtı ({payload.get('code', 'bilinmiyor')}): {payload.get('message', 'Mum verisi bulunamadı.')}")
-    frame = pd.DataFrame(payload["values"])
-    if not {"datetime", "close"}.issubset(frame.columns):
-        raise RuntimeError("API yanıtında datetime/close alanları bulunamadı.")
-    frame["timestamp"] = pd.to_datetime(frame["datetime"], errors="coerce")
-    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp", "close"]).sort_values("timestamp").reset_index(drop=True)
-    if len(frame) < 80:
-        raise RuntimeError(f"Yeterli mum gelmedi: {len(frame)}. En az 80 kayıt gerekiyor.")
-    return frame[["timestamp", "close"]]
-
-def analyze(frame, threshold):
-    d = frame.copy().sort_values("timestamp").reset_index(drop=True)
-    d["ema_fast"] = d["close"].ewm(span=12, adjust=False).mean()
-    d["ema_slow"] = d["close"].ewm(span=26, adjust=False).mean()
-    delta = d["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    d["rsi"] = 100 - (100 / (1 + rs))
-    d["returns"] = d["close"].pct_change()
-    d["volatility"] = d["returns"].rolling(14).std()
-    d["future_up"] = (d["close"].shift(-1) > d["close"]).astype(int)
-    d = d.dropna().reset_index(drop=True)
-    if len(d) < 80:
-        raise RuntimeError("Yeterli kullanılabilir mum yok.")
-    trainable = d.iloc[:-1].copy()
-    split = int(len(trainable) * 0.8)
-    if split < 40 or len(trainable) - split < 10:
-        raise RuntimeError("Eğitim/test verisi yetersiz.")
-    features = ["ema_fast", "ema_slow", "rsi", "returns", "volatility"]
-    X_train, y_train = trainable.iloc[:split][features], trainable.iloc[:split]["future_up"].astype(int)
-    X_test, y_test = trainable.iloc[split:][features], trainable.iloc[split:]["future_up"].astype(int)
-    model = RandomForestClassifier(n_estimators=150, max_depth=5, min_samples_leaf=5, random_state=42, class_weight="balanced")
-    model.fit(X_train, y_train)
-    accuracy = accuracy_score(y_test, model.predict(X_test)) if len(y_test) else float("nan")
-    classes = list(model.classes_)
-    probs = model.predict_proba(d.iloc[[-1]][features])[0]
-    prob_up = float(probs[classes.index(1)]) if 1 in classes else 0.5
-    confidence = max(prob_up, 1 - prob_up)
-    direction = "CALL / Yukarı" if prob_up >= 0.5 else "PUT / Aşağı"
-    return {
-        "data": d, "accuracy": accuracy, "direction": direction, "confidence": confidence,
-        "signal": direction if confidence >= threshold else "İŞLEM YOK — güven eşiği altında",
-        "close": float(d.iloc[-1]["close"]), "rsi": float(d.iloc[-1]["rsi"]),
-        "ema_fast": float(d.iloc[-1]["ema_fast"]), "ema_slow": float(d.iloc[-1]["ema_slow"]),
-    }
-
 if not API_KEY:
-    st.error("Twelve Data API anahtarı bulunamadı. Streamlit → Manage app → Settings → Secrets bölümünde TWELVE_DATA_API_KEY değişkenini kontrol edin.")
-    st.code('TWELVE_DATA_API_KEY = "kendi_api_anahtariniz"', language="toml")
+    st.error("API anahtarı bulunamadı. Streamlit → Manage app → Settings → Secrets içinde TWELVE_DATA_API_KEY tanımlı olmalı.")
+    st.code('TWELVE_DATA_API_KEY = "kendi_anahtariniz"', language="toml")
     st.stop()
-
-if st.button("Fiyat verisini yenile"):
+if refresh:
     st.cache_data.clear()
 
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_time_series(pair, interval, size, api_key):
+    response = requests.get("https://api.twelvedata.com/time_series", params={"symbol":pair,"interval":interval,"outputsize":size,"timezone":"Europe/Istanbul","apikey":api_key,"format":"JSON"}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status")=="error" or "values" not in payload:
+        raise RuntimeError(f"Twelve Data ({payload.get('code','hata')}): {payload.get('message','Mum verisi alınamadı.')}")
+    frame = pd.DataFrame(payload["values"])
+    if not {"datetime","close"}.issubset(frame.columns):
+        raise RuntimeError("API yanıtında datetime/close alanları eksik.")
+    frame["timestamp"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["timestamp","close"]).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    if len(frame)<100: raise RuntimeError(f"Yeterli mum gelmedi: {len(frame)}. En az 100 kayıt gerekli.")
+    return frame[["timestamp","close"]]
+
+FEATURES=["ema12","ema26","ema50","rsi","macd","macd_signal","return1","volatility"]
+def indicators(frame):
+    d=frame.copy().sort_values("timestamp").reset_index(drop=True); c=d.close
+    d["ema12"]=c.ewm(span=12,adjust=False).mean(); d["ema26"]=c.ewm(span=26,adjust=False).mean(); d["ema50"]=c.ewm(span=50,adjust=False).mean()
+    delta=c.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
+    d["rsi"]=100-(100/(1+gain/loss.replace(0,np.nan)))
+    d["macd"]=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean(); d["macd_signal"]=d.macd.ewm(span=9,adjust=False).mean()
+    d["return1"]=c.pct_change(); d["volatility"]=d.return1.rolling(14).std()
+    d["future_up"]=(c.shift(-1)>c).astype(float); d.loc[d.index[-1],"future_up"]=np.nan
+    return d
+
+def analyze(frame, threshold, min_votes):
+    usable=indicators(frame).dropna(subset=FEATURES).reset_index(drop=True)
+    labeled=usable.dropna(subset=["future_up"]).copy().reset_index(drop=True)
+    if len(labeled)<100: raise RuntimeError("Model için yeterli kullanılabilir mum yok.")
+    split=int(len(labeled)*.8)
+    if split<50 or len(labeled)-split<15: raise RuntimeError("Zaman sıralı eğitim/test örneği yetersiz.")
+    model=RandomForestClassifier(n_estimators=250,max_depth=5,min_samples_leaf=8,max_features="sqrt",random_state=42,class_weight="balanced")
+    model.fit(labeled.loc[:split-1,FEATURES],labeled.loc[:split-1,"future_up"].astype(int))
+    test=labeled.loc[split:]; accuracy=accuracy_score(test.future_up.astype(int),model.predict(test[FEATURES]))
+    latest=usable.iloc[[-1]]; classes=list(model.classes_); probs=model.predict_proba(latest[FEATURES])[0]
+    p_up=float(probs[classes.index(1)]) if 1 in classes else .5; confidence=max(p_up,1-p_up); model_dir="CALL" if p_up>=.5 else "PUT"
+    r=latest.iloc[0]
+    votes=[1 if r.ema12>r.ema26 else -1,1 if r.ema26>r.ema50 else -1,1 if r.macd>r.macd_signal else -1]
+    votes.append(1 if r.rsi>=55 else -1 if r.rsi<=45 else 0)
+    up=sum(v==1 for v in votes); down=sum(v==-1 for v in votes); tech_dir="CALL" if up>down else "PUT" if down>up else "BEKLE"
+    support=up if model_dir=="CALL" else down
+    if confidence<threshold: signal,reason="BEKLE","Model yön skoru eşik altında."
+    elif tech_dir=="BEKLE": signal,reason="BEKLE","Teknik göstergeler net bir yönde uzlaşmıyor."
+    elif model_dir!=tech_dir: signal,reason="BEKLE","Model yönü ile teknik göstergeler çelişiyor."
+    elif support<min_votes: signal,reason="BEKLE","Yeterli teknik gösterge aynı yönü desteklemiyor."
+    else: signal,reason=model_dir,"Model yönü ve teknik göstergeler aynı yönde; bu garanti değildir."
+    return {"data":usable,"accuracy":float(accuracy),"model_direction":model_dir,"confidence":confidence,"technical_direction":tech_dir,"signal":signal,"reason":reason,"close":float(r.close),"rsi":float(r.rsi),"ema12":float(r.ema12),"ema26":float(r.ema26),"ema50":float(r.ema50),"macd":float(r.macd),"timestamp":r.timestamp}
+
 try:
-    with st.spinner(f"{symbol} için M1 ve M5 fiyatları alınıyor..."):
-        m1_data = fetch_time_series(symbol, "1min", outputsize, API_KEY)
-        m5_data = fetch_time_series(symbol, "5min", outputsize, API_KEY)
+    with st.spinner(f"{symbol} için M1 ve M5 verileri alınıyor..."):
+        m1_data=fetch_time_series(symbol,"1min",outputsize,API_KEY); m5_data=fetch_time_series(symbol,"5min",outputsize,API_KEY)
 except requests.exceptions.Timeout:
-    st.error("Twelve Data isteği zaman aşımına uğradı. Daha sonra yeniden deneyin.")
-    st.stop()
+    st.error("Twelve Data isteği zaman aşımına uğradı. Biraz sonra deneyin."); st.stop()
 except requests.exceptions.RequestException as exc:
-    st.error(f"Ağ bağlantısı hatası: {exc}")
-    st.stop()
+    st.error(f"Ağ bağlantısı hatası: {exc}"); st.stop()
 except RuntimeError as exc:
-    st.error(str(exc))
-    st.info("API anahtarı, sembol erişimi, istek limiti ve ücretsiz plan kısıtlarını kontrol edin.")
-    st.stop()
-except Exception as exc:
-    st.error(f"Beklenmeyen hata: {exc}")
-    st.stop()
+    st.error(str(exc)); st.info("API anahtarı, sembol erişimi ve kullanım limitini kontrol edin."); st.stop()
 
-st.success(f"Veri alındı: {symbol} · Son M1 mumu: {m1_data['timestamp'].iloc[-1]} · Son M5 mumu: {m5_data['timestamp'].iloc[-1]}")
-results = {}
-cols = st.columns(2)
-for col, timeframe, frame in [(cols[0], "M1", m1_data), (cols[1], "M5", m5_data)]:
+now=datetime.now(TZ); now_naive=now.replace(tzinfo=None)
+def age(ts): return (now_naive-ts.to_pydatetime().replace(tzinfo=None)).total_seconds()/60
+age1,age5=age(m1_data.timestamp.iloc[-1]),age(m5_data.timestamp.iloc[-1])
+st.caption(f"İstanbul saati: {now:%d.%m.%Y %H:%M:%S} · Kaynak: Twelve Data REST · Sürekli WebSocket akışı değildir")
+if age1>5 or age5>10: st.warning(f"Veri eski görünüyor: M1 son mum {m1_data.timestamp.iloc[-1]:%H:%M}, M5 son mum {m5_data.timestamp.iloc[-1]:%H:%M}. Piyasa kapalı olabilir veya veri gecikiyor olabilir; sinyale güvenmeden önce kontrol edin.")
+elif age1 < -1 or age5 < -1: st.warning("API zaman damgası İstanbul saatinden ileride görünüyor. Saat dilimini kontrol etmek gerekiyor.")
+else: st.success(f"Veri alındı · M1: {m1_data.timestamp.iloc[-1]:%d.%m %H:%M} · M5: {m5_data.timestamp.iloc[-1]:%d.%m %H:%M} (İstanbul)")
+
+results={}; cols=st.columns(2)
+for col,tf,frame in [(cols[0],"M1",m1_data),(cols[1],"M5",m5_data)]:
     with col:
-        st.subheader(f"⏱️ {timeframe} Analizi")
-        try:
-            result = analyze(frame, threshold)
-            results[timeframe] = result
-        except Exception as exc:
-            st.error(f"{timeframe} analizi yapılamadı: {exc}")
-            continue
-        st.metric("Geçmiş test doğruluğu", f"{result['accuracy'] * 100:.1f}%")
-        st.metric("Son yön tahmini", result["direction"])
-        st.metric("Model güven skoru", f"{result['confidence'] * 100:.1f}%")
-        st.write(f"**Karar:** {result['signal']}")
-        st.write(f"**Son kapanış:** {result['close']:.5f}")
-        st.write(f"**RSI:** {result['rsi']:.1f} · **EMA12:** {result['ema_fast']:.5f} · **EMA26:** {result['ema_slow']:.5f}")
-        st.line_chart(result["data"].set_index("timestamp")[["close"]])
-        with st.expander(f"{timeframe} son 10 mum ve fiyat değişimi"):
-            recent = result["data"][["timestamp", "close"]].tail(10).copy()
-            recent["değişim (%)"] = recent["close"].pct_change() * 100
-            st.dataframe(recent, hide_index=True, use_container_width=True)
-            st.write(f"Veri aralığı: {result["data"]["timestamp"].iloc[0]} — {result["data"]["timestamp"].iloc[-1]}")
-
-st.subheader("M1 / M5 karşılaştırması")
-if len(results) == 2:
-    m1, m5 = results["M1"], results["M5"]
-    if m1["direction"] == m5["direction"]:
-        st.info(f"M1 ve M5 aynı yönü gösteriyor: {m1['direction']}. Bu, tahminin doğru olacağını garanti etmez.")
-    else:
-        st.warning("M1 ve M5 yönleri farklı. Sinyaller çelişiyor; temkinli değerlendirin.")
-    st.dataframe(pd.DataFrame([
-        {"Zaman dilimi": tf, "Yön": r["direction"], "Güven (%)": round(r["confidence"] * 100, 1), "Karar": r["signal"], "Test doğruluğu (%)": round(r["accuracy"] * 100, 1)}
-        for tf, r in results.items()
-    ]), hide_index=True, use_container_width=True)
-
-with st.expander("Veri ve model ayrıntıları"):
-    st.write("Kaynak: Twelve Data API")
-    st.write("Sembol:", symbol)
-    st.write("M1 kayıt sayısı:", len(m1_data), "· M5 kayıt sayısı:", len(m5_data))
-    st.write("Güven eşiği:", f"{threshold * 100:.0f}%")
-    st.caption("Test doğruluğu indirilen geçmiş veri aralığındaki basit zaman sıralı testtir; gelecekteki performansı garanti etmez.")
-
-st.caption("Normal piyasa verileri Pocket Option/OTC fiyatlarından farklılık gösterebilir. Prototip yatırım tavsiyesi değildir ve otomatik işlem yapmaz.")
+        st.subheader(f"{tf} ANALİZİ")
+        try: result=analyze(frame,threshold,min_votes); results[tf]=result
+        except Exception as exc: st.error(f"{tf} analizi yapılamadı: {exc}"); continue
+        st.metric("Karar",result["signal"]); st.metric("Model yön skoru",f'{result["confidence"]*100:.1f}%'); st.metric("Kronolojik test doğruluğu",f'{result["accuracy"]*100:.1f}%')
+        st.write(f'**Son fiyat:** {result["close"]:.5f}')
+        st.write(f'**Model:** {result["model_direction"]} · **Teknik:** {result["technical_direction"]}')
+        st.write(f'**RSI:** {result["rsi"]:.1f} · **EMA12:** {result["ema12"]:.5f} · **EMA26:** {result["ema26"]:.5f}')
+        st.caption(result["reason"])
+        st.line_chart(result["data"].tail(120).set_index("timestamp")[["close","ema12","ema26","ema50"]],use_container_width=True)
+        with st.expander(f"{tf} son 10 mum"):
+            recent=result["data"][["timestamp","close"]].tail(10).copy(); recent["değişim (%)"]=recent.close.pct_change()*100
+            st.dataframe(recent,hide_index=True,use_container_width=True)
+st.subheader("M1 / M5 UYUM KONTROLÜ")
+if len(results)==2:
+    m1,m5=results["M1"],results["M5"]
+    if m1["signal"]==m5["signal"] and m1["signal"] in ("CALL","PUT"): st.success(f'M1 ve M5 aynı yönde: {m1["signal"]}. Bu bir doğruluk garantisi değildir.')
+    elif "BEKLE" in (m1["signal"],m5["signal"]): st.info("En az bir zaman dilimi BEKLE diyor. Çelişkiyi zorla AL/SAT'a çevirmiyoruz.")
+    else: st.warning("M1 ve M5 yönleri farklı; ekstra temkin gerekir.")
+    st.dataframe(pd.DataFrame([{"Zaman":tf,"Karar":r["signal"],"Model yönü":r["model_direction"],"Model yön skoru (%)":round(r["confidence"]*100,1),"Test doğruluğu (%)":round(r["accuracy"]*100,1),"RSI":round(r["rsi"],1),"Son mum (İstanbul)":str(r["timestamp"])} for tf,r in results.items()]),hide_index=True,use_container_width=True)
+with st.expander("Veri ve model notları"):
+    st.write(f"Sembol: {symbol} · M1 kayıt: {len(m1_data)} · M5 kayıt: {len(m5_data)}")
+    st.write(f"Son M1 yaşı: {age1:.1f} dakika · Son M5 yaşı: {age5:.1f} dakika")
+    st.caption("Model yön skoru kazanma olasılığı değildir. Test geçmiş verinin kronolojik bölümünde yapılır; geleceği garanti etmez. Uygulama otomatik işlem açmaz.")
+st.caption("Pocket AI Agent · Demo analiz aracı · Normal forex verisi OTC fiyatıyla farklı olabilir.")

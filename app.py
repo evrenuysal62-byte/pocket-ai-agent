@@ -126,7 +126,12 @@ for col, timeframe, frame in [(cols[0], "M1", m1_data), (cols[1], "M5", m5_data)
         st.write(f"**Karar:** {result['signal']}")
         st.write(f"**Son kapanış:** {result['close']:.5f}")
         st.write(f"**RSI:** {result['rsi']:.1f} · **EMA12:** {result['ema_fast']:.5f} · **EMA26:** {result['ema_slow']:.5f}")
-        st.line_chart(result["data"].set_index("timestamp")["close"])
+        st.line_chart(result["data"].set_index("timestamp")[["close"]])
+        with st.expander(f"{timeframe} son 10 mum ve fiyat değişimi"):
+            recent = result["data"][["timestamp", "close"]].tail(10).copy()
+            recent["değişim (%)"] = recent["close"].pct_change() * 100
+            st.dataframe(recent, hide_index=True, use_container_width=True)
+            st.write(f"Veri aralığı: {result["data"]["timestamp"].iloc[0]} — {result["data"]["timestamp"].iloc[-1]}")
 
 st.subheader("M1 / M5 karşılaştırması")
 if len(results) == 2:

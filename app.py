@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import plotly.graph_objects as go
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from sklearn.ensemble import RandomForestClassifier
@@ -48,13 +49,27 @@ def fetch_time_series(pair, interval, size, api_key):
     if payload.get("status")=="error" or "values" not in payload:
         raise RuntimeError(f"Twelve Data ({payload.get('code','hata')}): {payload.get('message','Mum verisi alınamadı.')}")
     frame = pd.DataFrame(payload["values"])
-    if not {"datetime","close"}.issubset(frame.columns):
-        raise RuntimeError("API yanıtında datetime/close alanları eksik.")
+    required = {"datetime", "open", "high", "low", "close"}
+    if not required.issubset(frame.columns):
+        raise RuntimeError(
+            "Twelve Data yanıtında OHLC mum alanları eksik. "
+            "Grafik için datetime, open, high, low ve close alanları gerekiyor."
+        )
     frame["timestamp"] = pd.to_datetime(frame["datetime"], errors="coerce")
-    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp","close"]).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
-    if len(frame)<100: raise RuntimeError(f"Yeterli mum gelmedi: {len(frame)}. En az 100 kayıt gerekli.")
-    return frame[["timestamp","close"]]
+    for column in ["open", "high", "low", "close"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (
+        frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+    if len(frame) < 100:
+        raise RuntimeError(f"Yeterli mum gelmedi: {len(frame)}. En az 100 kayıt gerekli.")
+    # A flat series can indicate a feed/symbol issue; surface it rather than disguising it.
+    if frame["close"].tail(30).nunique() < 3:
+        st.warning("Son 30 mumda fiyat neredeyse hiç değişmiyor. Sembol/veri akışını kontrol edin; bu veriyle sinyal güvenilir kabul edilmemeli.")
+    return frame[["timestamp", "open", "high", "low", "close"]]
 
 FEATURES=["ema12","ema26","ema50","rsi","macd","macd_signal","return1","volatility"]
 def indicators(frame):
@@ -119,9 +134,33 @@ for col,tf,frame in [(cols[0],"M1",m1_data),(cols[1],"M5",m5_data)]:
         st.write(f'**Model:** {result["model_direction"]} · **Teknik:** {result["technical_direction"]}')
         st.write(f'**RSI:** {result["rsi"]:.1f} · **EMA12:** {result["ema12"]:.5f} · **EMA26:** {result["ema26"]:.5f}')
         st.caption(result["reason"])
-        st.line_chart(result["data"].tail(120).set_index("timestamp")[["close","ema12","ema26","ema50"]],use_container_width=True)
+        # Candlestick chart: use actual OHLC fields rather than plotting only closes.
+        chart_data = result["data"].tail(100).copy()
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=chart_data["timestamp"],
+            open=chart_data["open"], high=chart_data["high"],
+            low=chart_data["low"], close=chart_data["close"],
+            name="Fiyat",
+            increasing_line_color="#d6ad4f",
+            decreasing_line_color="#e05b63",
+        ))
+        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema12"],
+                                 mode="lines", name="EMA12", line=dict(color="#f3d27a", width=1.5)))
+        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema26"],
+                                 mode="lines", name="EMA26", line=dict(color="#68a7ff", width=1.3)))
+        fig.add_trace(go.Scatter(x=chart_data["timestamp"], y=chart_data["ema50"],
+                                 mode="lines", name="EMA50", line=dict(color="#b08cff", width=1.2)))
+        fig.update_layout(
+            template="plotly_dark", height=420, margin=dict(l=8, r=8, t=28, b=8),
+            paper_bgcolor="#11151c", plot_bgcolor="#11151c",
+            xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.04, x=0),
+            xaxis_title="İstanbul saati", yaxis_title="Fiyat",
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "responsive": True})
         with st.expander(f"{tf} son 10 mum"):
-            recent=result["data"][["timestamp","close"]].tail(10).copy(); recent["değişim (%)"]=recent.close.pct_change()*100
+            recent=result["data"][["timestamp","open","high","low","close"]].tail(10).copy()
+            recent["değişim (%)"]=recent["close"].pct_change()*100
             st.dataframe(recent,hide_index=True,use_container_width=True)
 st.subheader("M1 / M5 UYUM KONTROLÜ")
 if len(results)==2:

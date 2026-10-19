@@ -170,11 +170,76 @@ for col, tf, frame in [(cols[0], "M1", m1_data), (cols[1], "M5", m5_data)]:
             recent["değişim (%)"] = recent["close"].pct_change() * 100
             st.dataframe(recent, hide_index=True, use_container_width=True)
 
+def joint_signal_check(results, age1, age5):
+    """Conservative M1/M5 gate: disagreement or stale data always means WAIT."""
+    if len(results) != 2:
+        return {"signal": "BEKLE", "reasons": ["M1 ve M5 analizlerinin ikisi de hazır değil."], "checks": []}
+    m1, m5 = results["M1"], results["M5"]
+    reasons, checks = [], []
+    stale = age1 > 5 or age5 > 10 or age1 < -1 or age5 < -1
+    if stale:
+        reasons.append("Veri güncelliği güvenli eşik dışında (M1 > 5 dk veya M5 > 10 dk ya da gelecek zaman damgası).")
+    checks.append(("Veri güncelliği", not stale))
+
+    model_agree = m1["model_direction"] == m5["model_direction"]
+    checks.append(("M1/M5 model yönü aynı", model_agree))
+    if not model_agree:
+        reasons.append("M1 ve M5 model yönleri çelişiyor.")
+
+    signal_agree = m1["signal"] == m5["signal"] and m1["signal"] in ("Yükseliş", "Düşüş")
+    checks.append(("İki zaman diliminde de yönlü karar", signal_agree))
+    if not signal_agree:
+        reasons.append("İki zaman diliminde de aynı yönlü karar oluşmadı.")
+
+    direction = m1["model_direction"]
+    def supports(r, d):
+        macd_signal = float(r["data"].iloc[-1]["macd_signal"])
+        ema_ok = r["ema12"] > r["ema26"] > r["ema50"] if d == "Yükseliş" else r["ema12"] < r["ema26"] < r["ema50"]
+        rsi_ok = 50 <= r["rsi"] < 70 if d == "Yükseliş" else 30 < r["rsi"] <= 50
+        macd_ok = r["macd"] > macd_signal if d == "Yükseliş" else r["macd"] < macd_signal
+        return ema_ok, rsi_ok, macd_ok
+
+    indicators_ok = True
+    for tf, r in (("M1", m1), ("M5", m5)):
+        ema_ok, rsi_ok, macd_ok = supports(r, direction)
+        checks.extend([(f"{tf} EMA sıralaması yönü destekliyor", ema_ok),
+                       (f"{tf} RSI yönü destekliyor ve aşırı bölgede değil", rsi_ok),
+                       (f"{tf} MACD yönü destekliyor", macd_ok)])
+        if not (ema_ok and rsi_ok and macd_ok):
+            indicators_ok = False
+            missed = []
+            if not ema_ok: missed.append("EMA sıralaması")
+            if not rsi_ok: missed.append(f"RSI ({r['rsi']:.1f})")
+            if not macd_ok: missed.append("MACD")
+            reasons.append(f"{tf}: " + ", ".join(missed) + " aynı yönü yeterince desteklemiyor.")
+
+    confidence_ok = m1["confidence"] >= threshold and m5["confidence"] >= threshold
+    checks.append(("Her iki model skoru eşik üzerinde", confidence_ok))
+    if not confidence_ok:
+        reasons.append("En az bir modelin yön skoru belirlenen eşikten düşük.")
+
+    final_signal = direction if not reasons and indicators_ok and confidence_ok and signal_agree and model_agree else "BEKLE"
+    if final_signal == "BEKLE" and not reasons:
+        reasons.append("Tüm güvenlik kontrolleri geçilmedi.")
+    return {"signal": final_signal, "reasons": reasons, "checks": checks}
+
 st.subheader("M1 / M5 UYUM KONTROLÜ")
+joint = joint_signal_check(results, age1, age5)
+st.markdown("#### Birleşik karar")
+joint_display = ("İŞLEME GİR · " + joint["signal"]) if joint["signal"] in ("Yükseliş", "Düşüş") else "İŞLEME GİRME"
+st.metric("M1 + M5 güvenlik filtresi", joint_display)
+if joint["signal"] == "BEKLE":
+    st.warning("İŞLEME GİRME: Gerekli güvenlik kontrollerinin tamamı geçmedi. Zorla sinyal üretmiyoruz.")
+    for reason in joint["reasons"]:
+        st.write(f"- {reason}")
+else:
+    st.success(f"İŞLEME GİR · {joint['signal']}: Tüm filtreler uyumlu. Bu, başarı veya kâr garantisi değildir; önce demo ortamında doğrulayın.")
+with st.expander("Birleşik kararın kontrol listesi"):
+    st.dataframe(pd.DataFrame([{"Kontrol": name, "Sonuç": "GEÇTİ" if ok else "GEÇMEDİ"} for name, ok in joint["checks"]]), hide_index=True, use_container_width=True)
 if len(results) == 2:
     m1, m5 = results["M1"], results["M5"]
     if m1["signal"] == m5["signal"] and m1["signal"] in ("Yükseliş", "Düşüş"):
-        st.success(f'M1 ve M5 aynı yönde: {m1["signal"]}. Bu bir doğruluk garantisi değildir.')
+        st.info(f'M1 ve M5 bireysel kararları aynı yönde: {m1["signal"]}; birleşik filtre ayrıca RSI, MACD, EMA ve veri güncelliğini denetler.')
     elif "BEKLE" in (m1["signal"], m5["signal"]):
         st.info("En az bir zaman dilimi BEKLE diyor. Çelişkiyi zorla sinyale çevirmiyoruz.")
     else:
@@ -191,7 +256,7 @@ if len(results) == 2:
 st.subheader("YAPAY ZEKÂ TARZI YORUM · ÜCRETSİZ")
 st.caption("Bu mod mevcut M1/M5 verilerini kurallarla yorumlar. Harici ChatGPT/OpenAI servisine bağlanmaz ve API ücreti oluşturmaz.")
 
-def build_free_commentary(results, age1, age5, symbol):
+def build_free_commentary(results, age1, age5, symbol, joint=None):
     if len(results) != 2:
         return "M1 ve M5 analizlerinin ikisi de hazır olmadığı için ortak yorum üretilemedi. Veriyi yenileyip tekrar deneyin."
     m1, m5 = results["M1"], results["M5"]
@@ -221,21 +286,23 @@ def build_free_commentary(results, age1, age5, symbol):
             facts.append(f"RSI {r['rsi']:.1f} nötr bölgede")
         facts.append("MACD çizgisi sinyal çizgisinin üzerinde" if r['macd'] > r['data'].iloc[-1]['macd_signal'] else "MACD çizgisi sinyal çizgisinin altında veya eşit")
         lines.append(f"{tf} teknik görünüm: " + "; ".join(facts) + ".")
-    if m1['signal'] == m5['signal'] and m1['signal'] in ("Yükseliş", "Düşüş") and not stale:
-        lines.append(f"ÖZET: İki zaman diliminde de {m1['signal']} kararı var. Bu yalnızca aday sinyaldir; işlem öncesi kapanmış mum, fiyat akışı ve demo test sonuçlarını doğrulayın.")
-    elif stale:
-        lines.append("ÖZET: BEKLE — veri güncelliği doğrulanmadan karar üretmeyin.")
+    if joint is None:
+        joint = joint_signal_check(results, age1, age5)
+    if joint["signal"] in ("Yükseliş", "Düşüş"):
+        lines.append(f"ÖZET: İŞLEME GİR · {joint['signal']}. Bu yalnızca test edilecek adaydır; gerçek işlemden önce kapanmış mum, fiyat akışı ve demo sonuçlarını doğrulayın.")
     else:
-        lines.append("ÖZET: BEKLE — iki zaman diliminde ortak, yeterince tutarlı bir karar yok. Eşikleri düşürerek çelişkiyi zorla sinyale çevirmeyin.")
+        lines.append("ÖZET: İŞLEME GİRME — birleşik güvenlik filtresi tüm koşulları aynı anda doğrulayamadı.")
+        if joint["reasons"]:
+            lines.append("İŞLEME GİRME nedenleri: " + " ".join(joint["reasons"]))
     lines.append("TEST UYARISI: Ekrandaki model yön skoru kazanma olasılığı değildir. Kronolojik test doğruluğu da tek başına kârlılığı göstermez; işlem maliyetleri ve farklı piyasa dönemleri ayrıca test edilmelidir.")
     return "\n\n".join(lines)
 
 if st.button("✦ Ücretsiz akıllı yorum üret", use_container_width=True):
-    st.session_state["free_ai_commentary"] = build_free_commentary(results, age1, age5, symbol)
+    st.session_state["free_ai_commentary"] = build_free_commentary(results, age1, age5, symbol, joint)
 if st.session_state.get("free_ai_commentary"):
     st.markdown("### Piyasa yorum raporu")
     st.info(st.session_state["free_ai_commentary"])
-    st.caption("Bu, uygulama içinde çalışan kural tabanlı yorumdur; ChatGPT tarafından üretilmez. Gerçek ChatGPT yorumu için API veya ayrı bir entegrasyon gerekir.")
+    st.caption("Bu, uygulama içinde çalışan kural tabanlı yorumdur; ChatGPT tarafından üretilmez. ‘İŞLEME GİR’ kesin kazanç veya emir garantisi değildir; uygulama otomatik işlem açmaz.")
 
 with st.expander("Veri ve model notları"):
     st.write(f"Sembol: {symbol} · M1 kayıt: {len(m1_data)} · M5 kayıt: {len(m5_data)}")

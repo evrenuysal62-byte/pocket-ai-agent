@@ -71,68 +71,39 @@ def fetch_time_series(pair, interval, size, api_key):
         st.warning("Son 30 mumda fiyat neredeyse hiç değişmiyor. Sembol/veri akışını kontrol edin; bu veriyle sinyal güvenilir kabul edilmemeli.")
     return frame[["timestamp", "open", "high", "low", "close"]]
 
-FEATURES=["ema12_gap","ema26_gap","ema50_gap","rsi","macd_gap","macd_signal_gap","return1","momentum3","volatility","range_pct","body_pct"]
+FEATURES=["ema12","ema26","ema50","rsi","macd","macd_signal","return1","volatility"]
 def indicators(frame):
     d=frame.copy().sort_values("timestamp").reset_index(drop=True); c=d.close
     d["ema12"]=c.ewm(span=12,adjust=False).mean(); d["ema26"]=c.ewm(span=26,adjust=False).mean(); d["ema50"]=c.ewm(span=50,adjust=False).mean()
     delta=c.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
-    rs=gain/loss.replace(0,np.nan)
-    d["rsi"]=100-(100/(1+rs))
-    d.loc[(loss==0)&(gain>0),"rsi"]=100
+    d["rsi"]=100-(100/(1+gain/loss.replace(0,np.nan)))
     d["macd"]=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean(); d["macd_signal"]=d.macd.ewm(span=9,adjust=False).mean()
-    # Fiyat seviyesinden bağımsız, farklı paritelerde daha karşılaştırılabilir özellikler.
-    safe_close=c.replace(0,np.nan)
-    d["ema12_gap"]=(c-d.ema12)/safe_close*10000
-    d["ema26_gap"]=(c-d.ema26)/safe_close*10000
-    d["ema50_gap"]=(c-d.ema50)/safe_close*10000
-    d["macd_gap"]=(d.macd-d.macd_signal)/safe_close*10000
-    d["macd_signal_gap"]=d.macd_signal.diff()
-    d["return1"]=c.pct_change()*100
-    d["momentum3"]=c.pct_change(3)*100
-    d["volatility"]=d.return1.rolling(14).std()
-    d["range_pct"]=(d.high-d.low)/safe_close*100
-    d["body_pct"]=(d.close-d.open)/safe_close*100
+    d["return1"]=c.pct_change(); d["volatility"]=d.return1.rolling(14).std()
     d["future_up"]=(c.shift(-1)>c).astype(float); d.loc[d.index[-1],"future_up"]=np.nan
     return d
 
 def analyze(frame, threshold, min_votes):
-    all_data=indicators(frame)
-    usable=all_data.dropna(subset=FEATURES+['ema12','ema26','ema50','macd','macd_signal','rsi']).reset_index(drop=True)
+    usable=indicators(frame).dropna(subset=FEATURES).reset_index(drop=True)
     labeled=usable.dropna(subset=["future_up"]).copy().reset_index(drop=True)
     if len(labeled)<100: raise RuntimeError("Model için yeterli kullanılabilir mum yok.")
     split=int(len(labeled)*.8)
     if split<50 or len(labeled)-split<15: raise RuntimeError("Zaman sıralı eğitim/test örneği yetersiz.")
-    model=RandomForestClassifier(n_estimators=350,max_depth=6,min_samples_leaf=10,max_features="sqrt",random_state=42,class_weight="balanced_subsample")
+    model=RandomForestClassifier(n_estimators=250,max_depth=5,min_samples_leaf=8,max_features="sqrt",random_state=42,class_weight="balanced")
     model.fit(labeled.loc[:split-1,FEATURES],labeled.loc[:split-1,"future_up"].astype(int))
-    test=labeled.loc[split:]
-    accuracy=accuracy_score(test.future_up.astype(int),model.predict(test[FEATURES]))
+    test=labeled.loc[split:]; accuracy=accuracy_score(test.future_up.astype(int),model.predict(test[FEATURES]))
     latest=usable.iloc[[-1]]; classes=list(model.classes_); probs=model.predict_proba(latest[FEATURES])[0]
-    p_up=float(probs[classes.index(1)]) if 1 in classes else .5
-    confidence=max(p_up,1-p_up); model_dir="Yükseliş" if p_up>=.5 else "Düşüş"
+    p_up=float(probs[classes.index(1)]) if 1 in classes else .5; confidence=max(p_up,1-p_up); model_dir="Yükseliş" if p_up>=.5 else "Düşüş"
     r=latest.iloc[0]
-    # Altı ayrı teknik kontrol; nötr momentum/RSI zorla yön oyu üretmez.
-    votes=[
-        1 if r.ema12>r.ema26 else -1,
-        1 if r.ema26>r.ema50 else -1,
-        1 if r.macd>r.macd_signal else -1,
-        1 if r.close>r.ema50 else -1,
-        1 if r.momentum3>0.015 else -1 if r.momentum3 < -0.015 else 0,
-        1 if r.rsi>=52 else -1 if r.rsi<=48 else 0,
-    ]
-    up=sum(v==1 for v in votes); down=sum(v==-1 for v in votes)
-    tech_dir="Yükseliş" if up>down else "Düşüş" if down>up else "BEKLE"
+    votes=[1 if r.ema12>r.ema26 else -1,1 if r.ema26>r.ema50 else -1,1 if r.macd>r.macd_signal else -1]
+    votes.append(1 if r.rsi>=55 else -1 if r.rsi<=45 else 0)
+    up=sum(v==1 for v in votes); down=sum(v==-1 for v in votes); tech_dir="Yükseliş" if up>down else "Düşüş" if down>up else "BEKLE"
     support=up if model_dir=="Yükseliş" else down
-    if confidence<threshold:
-        signal,reason="BEKLE","Model yön skoru seçilen eşik altında."
-    elif tech_dir=="BEKLE":
-        signal,reason="BEKLE","Teknik kontroller aynı yönde yeterince birleşmiyor."
-    elif model_dir!=tech_dir:
-        signal,reason="BEKLE","Model yönü ve teknik kontroller birbiriyle çelişiyor."
-    elif support<min_votes:
-        signal,reason="BEKLE",f"Yönü destekleyen teknik kontrol sayısı yetersiz ({support})."
-    else:
-        signal,reason=model_dir,f"Model ve teknik kontroller aynı yönde ({support}/6). Bu, işlem başarısı garantisi değildir."
-    return {"data":usable,"accuracy":float(accuracy),"model_direction":model_dir,"confidence":confidence,"p_up":p_up,"technical_direction":tech_dir,"signal":signal,"reason":reason,"support":support,"up_votes":up,"down_votes":down,"close":float(r.close),"rsi":float(r.rsi),"ema12":float(r.ema12),"ema26":float(r.ema26),"ema50":float(r.ema50),"macd":float(r.macd),"momentum3":float(r.momentum3),"timestamp":r.timestamp}
+    if confidence<threshold: signal,reason="BEKLE","Model yön skoru eşik altında."
+    elif tech_dir=="BEKLE": signal,reason="BEKLE","Teknik göstergeler net bir yönde uzlaşmıyor."
+    elif model_dir!=tech_dir: signal,reason="BEKLE","Model yönü ile teknik göstergeler çelişiyor."
+    elif support<min_votes: signal,reason="BEKLE","Yeterli teknik gösterge aynı yönü desteklemiyor."
+    else: signal,reason=model_dir,"Model yönü ve teknik göstergeler aynı yönde; bu garanti değildir."
+    return {"data":usable,"accuracy":float(accuracy),"model_direction":model_dir,"confidence":confidence,"technical_direction":tech_dir,"signal":signal,"reason":reason,"close":float(r.close),"rsi":float(r.rsi),"ema12":float(r.ema12),"ema26":float(r.ema26),"ema50":float(r.ema50),"macd":float(r.macd),"timestamp":r.timestamp}
 
 try:
     with st.spinner(f"{symbol} için M1 ve M5 verileri alınıyor..."):
@@ -166,12 +137,11 @@ for col, tf, frame in [(cols[0], "M1", m1_data), (cols[1], "M5", m5_data)]:
             continue
 
         st.metric("Karar", result["signal"])
-        st.metric("Model yön skoru (olasılık değildir)", f'{result["confidence"] * 100:.1f}%')
+        st.metric("Model yön skoru", f'{result["confidence"] * 100:.1f}%')
         st.metric("Kronolojik test doğruluğu", f'{result["accuracy"] * 100:.1f}%')
         st.write(f'**Son fiyat:** {result["close"]:.5f}')
         st.write(f'**Model:** {result["model_direction"]} · **Teknik:** {result["technical_direction"]}')
-        st.write(f'**RSI:** {result["rsi"]:.1f} · **3 mum momentumu:** {result["momentum3"]:.3f}%')
-        st.write(f'**Teknik destek:** {result["support"]}/6 kontrol · **Yükseliş/Düşüş oyları:** {result["up_votes"]}/{result["down_votes"]}')
+        st.write(f'**RSI:** {result["rsi"]:.1f} · **EMA12:** {result["ema12"]:.5f} · **EMA26:** {result["ema26"]:.5f}')
         st.caption(result["reason"])
 
         chart_data = result["data"].tail(100).copy()
@@ -204,25 +174,72 @@ st.subheader("M1 / M5 UYUM KONTROLÜ")
 if len(results) == 2:
     m1, m5 = results["M1"], results["M5"]
     if m1["signal"] == m5["signal"] and m1["signal"] in ("Yükseliş", "Düşüş"):
-        st.success(f'GENEL DURUM: {m1["signal"]} ADAYI · M1 ve M5 aynı yönde. Bu otomatik işlem emri değildir; başarı garantisi yoktur.')
-    elif m1["model_direction"] == m5["model_direction"] and m1["model_direction"] in ("Yükseliş", "Düşüş"):
-        st.info(f'GENEL DURUM: {m1["model_direction"]} YÖNÜ İZLENİYOR · Model yönleri aynı ancak teknik şartlar tam onay vermiyor. Şimdilik BEKLE.')
+        st.success(f'M1 ve M5 aynı yönde: {m1["signal"]}. Bu bir doğruluk garantisi değildir.')
     elif "BEKLE" in (m1["signal"], m5["signal"]):
-        st.info("GENEL DURUM: BEKLE · En az bir zaman diliminde onay eksik. Çelişkiyi zorla sinyale çevirmiyoruz.")
+        st.info("En az bir zaman dilimi BEKLE diyor. Çelişkiyi zorla sinyale çevirmiyoruz.")
     else:
-        st.warning("GENEL DURUM: BEKLE · M1 ve M5 yönleri farklı.")
+        st.warning("M1 ve M5 yönleri farklı; ekstra temkin gerekir.")
     st.dataframe(pd.DataFrame([
         {"Zaman": tf, "Karar": r["signal"], "Model yönü": r["model_direction"],
          "Model yön skoru (%)": round(r["confidence"] * 100, 1),
          "Test doğruluğu (%)": round(r["accuracy"] * 100, 1), "RSI": round(r["rsi"], 1),
-         "Teknik destek (/6)": r["support"], "3 mum momentumu (%)": round(r["momentum3"], 3),
          "Son mum (İstanbul)": str(r["timestamp"])}
         for tf, r in results.items()
     ]), hide_index=True, use_container_width=True)
 
+
+st.subheader("YAPAY ZEKÂ TARZI YORUM · ÜCRETSİZ")
+st.caption("Bu mod mevcut M1/M5 verilerini kurallarla yorumlar. Harici ChatGPT/OpenAI servisine bağlanmaz ve API ücreti oluşturmaz.")
+
+def build_free_commentary(results, age1, age5, symbol):
+    if len(results) != 2:
+        return "M1 ve M5 analizlerinin ikisi de hazır olmadığı için ortak yorum üretilemedi. Veriyi yenileyip tekrar deneyin."
+    m1, m5 = results["M1"], results["M5"]
+    lines = [f"Parite: {symbol}", f"M1 karar: {m1['signal']} · model yönü {m1['model_direction']} ({m1['confidence']*100:.1f} yön skoru).", f"M5 karar: {m5['signal']} · model yönü {m5['model_direction']} ({m5['confidence']*100:.1f} yön skoru)."]
+    stale = age1 > 5 or age5 > 10 or age1 < -1 or age5 < -1
+    if stale:
+        lines.append("VERİ KALİTESİ: Son mumların zamanı güncel görünmüyor. Önce veri zamanını ve piyasa durumunu doğrulayın; sinyali kullanmayın.")
+    if m1['model_direction'] == m5['model_direction']:
+        lines.append(f"ZAMAN DİLİMİ: M1 ve M5 model yönleri {m1['model_direction']} tarafında aynı. Bu, tek başına giriş gerekçesi değildir.")
+    else:
+        lines.append("ZAMAN DİLİMİ: M1 ve M5 model yönleri farklı. Kısa ve daha geniş zaman dilimi çatıştığı için temkinli kalmak daha mantıklı.")
+    for tf, r in (("M1", m1), ("M5", m5)):
+        facts = []
+        if r['ema12'] > r['ema26']:
+            facts.append("EMA12, EMA26'nın üzerinde")
+        else:
+            facts.append("EMA12, EMA26'nın altında veya eşit")
+        if r['ema26'] > r['ema50']:
+            facts.append("EMA26, EMA50'nin üzerinde")
+        else:
+            facts.append("EMA26, EMA50'nin altında veya eşit")
+        if r['rsi'] >= 55:
+            facts.append(f"RSI {r['rsi']:.1f} yükseliş momentumunu destekliyor")
+        elif r['rsi'] <= 45:
+            facts.append(f"RSI {r['rsi']:.1f} düşüş momentumunu destekliyor")
+        else:
+            facts.append(f"RSI {r['rsi']:.1f} nötr bölgede")
+        facts.append("MACD çizgisi sinyal çizgisinin üzerinde" if r['macd'] > r['data'].iloc[-1]['macd_signal'] else "MACD çizgisi sinyal çizgisinin altında veya eşit")
+        lines.append(f"{tf} teknik görünüm: " + "; ".join(facts) + ".")
+    if m1['signal'] == m5['signal'] and m1['signal'] in ("Yükseliş", "Düşüş") and not stale:
+        lines.append(f"ÖZET: İki zaman diliminde de {m1['signal']} kararı var. Bu yalnızca aday sinyaldir; işlem öncesi kapanmış mum, fiyat akışı ve demo test sonuçlarını doğrulayın.")
+    elif stale:
+        lines.append("ÖZET: BEKLE — veri güncelliği doğrulanmadan karar üretmeyin.")
+    else:
+        lines.append("ÖZET: BEKLE — iki zaman diliminde ortak, yeterince tutarlı bir karar yok. Eşikleri düşürerek çelişkiyi zorla sinyale çevirmeyin.")
+    lines.append("TEST UYARISI: Ekrandaki model yön skoru kazanma olasılığı değildir. Kronolojik test doğruluğu da tek başına kârlılığı göstermez; işlem maliyetleri ve farklı piyasa dönemleri ayrıca test edilmelidir.")
+    return "\n\n".join(lines)
+
+if st.button("✦ Ücretsiz akıllı yorum üret", use_container_width=True):
+    st.session_state["free_ai_commentary"] = build_free_commentary(results, age1, age5, symbol)
+if st.session_state.get("free_ai_commentary"):
+    st.markdown("### Piyasa yorum raporu")
+    st.info(st.session_state["free_ai_commentary"])
+    st.caption("Bu, uygulama içinde çalışan kural tabanlı yorumdur; ChatGPT tarafından üretilmez. Gerçek ChatGPT yorumu için API veya ayrı bir entegrasyon gerekir.")
+
 with st.expander("Veri ve model notları"):
     st.write(f"Sembol: {symbol} · M1 kayıt: {len(m1_data)} · M5 kayıt: {len(m5_data)}")
     st.write(f"Son M1 yaşı: {age1:.1f} dakika · Son M5 yaşı: {age5:.1f} dakika")
-    st.caption("Model yön skoru kazanma olasılığı değildir. Teknik destek 6 kontrolden hesaplanır. Test geçmiş verinin kronolojik bölümünde yapılır; geleceği garanti etmez. Uygulama otomatik işlem açmaz.")
+    st.caption("Model yön skoru kazanma olasılığı değildir. Test geçmiş verinin kronolojik bölümünde yapılır; geleceği garanti etmez. Uygulama otomatik işlem açmaz.")
 
 st.caption("Pocket AI Agent · Demo analiz aracı · Normal forex verisi OTC fiyatıyla farklı olabilir.")
